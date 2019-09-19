@@ -1,8 +1,10 @@
 import argparse
+import multiprocessing
+import os
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
-from typing import List, Tuple
+from typing import List, Tuple, Union, Optional
 
 import ujson as json
 from PIL import Image
@@ -45,24 +47,32 @@ class Profile(object):
         return '(%s)' % (' '.join(pieces) if pieces else '0 sec')
 
 
-def _get_elevations_along_path(from_pos, to_pos, n_samples):
-    # type: (Tuple[float, float], Tuple[float, float], int) -> List
+def _get_url_along_path(from_pos, to_pos, n_samples):
     from_lat, from_lng = from_pos
     to_lat, to_lng = to_pos
-    parameters = {
+    return '%s?%s' % (ELEVATION_BASE_URL, urllib.parse.urlencode({
         'path': '%s,%s|%s,%s' % (from_lat, from_lng, to_lat, to_lng),
         'samples': n_samples,
         'key': API_KEY
-    }
-    data = urllib.parse.urlencode(parameters)
-    url = '%s?%s' % (ELEVATION_BASE_URL, data)
+    }))
+
+
+def _get_elevations_along_path(parameters):
+    # type: (Tuple[str, int, Optional[int]]) -> Union[List, Tuple[int, List]]
+    url, n_samples, number = parameters
     with urllib.request.urlopen(url) as response:
         decoded_response = json.loads(response.read().decode())
     if decoded_response['status'] != 'OK':
         raise RuntimeError(decoded_response['status'])
     if len(decoded_response['results']) != n_samples:
         raise RuntimeError('INVALID_RESPONSE_LENGTH')
-    return decoded_response['results']
+    output = [(res['elevation'], res['resolution']) for res in decoded_response['results']]
+    del decoded_response
+    if number is None:
+        return output
+    if number % 100 == 0:
+        print('Query', number + 1)
+    return number, output
 
 
 def _get_elevations(locations=()):
@@ -98,15 +108,42 @@ def get_elevations(locations=()):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('nw_lat', type=float)
-    parser.add_argument('nw_lng', type=float)
-    parser.add_argument('se_lat', type=float)
-    parser.add_argument('se_lng', type=float)
-    parser.add_argument('--output', '-o', type=str, default='output.png')
-    parser.add_argument('--resolution', '-r', type=float, default=10)
-    parser.add_argument('--compute-only', '-c', action='store_true')
-    parser.add_argument('--estimate', '-e', type=int, default=0)
+    parser = argparse.ArgumentParser(
+        prog='Generate height map (grayscale image) for a rectangle based on '
+             'north-west and south-east coordinates.',
+        description='Given north-west and south-east coordinates, the script will '
+                    'sample points in corresponding geographical rectangle, '
+                    'retrieve altitude for sampled points, '
+                    'and save it in a grayscale image. '
+                    'Google elevation API is used to get elevation data.'
+    )
+    parser.add_argument('nw_lat', type=float,
+                        help='North-west latitude')
+    parser.add_argument('nw_lng', type=float,
+                        help='North-west longitude')
+    parser.add_argument('se_lat', type=float,
+                        help='South-east latitude')
+    parser.add_argument('se_lng', type=float,
+                        help='South-east longitutde')
+    parser.add_argument('--output', '-o', type=str, default='output.png',
+                        help='Output file name (default: "output.png")')
+    parser.add_argument('--resolution', '-r', type=float, default=10,
+                        help='resolution (in meters) to use to sample rectangle. '
+                             'Default is 10 meters. For example, if rectangle size is 1 x 1 Km '
+                             'and resolution is 10m, then rectangle will be sampled in each 10m '
+                             'to comppute (1000/10 + 1) = 101 points in width, and same in height. '
+                             'Output image will then have 101 x 101 = 10201 pixels.')
+    parser.add_argument('--compute-only', '-c', action='store_true',
+                        help='If specified, script will just compute and display '
+                             'number of sampled points without generating anything.')
+    parser.add_argument('--estimate', '-e', type=int, default=0,
+                        help='A number of points for which to compute estimated time '
+                             'to retrieve elevation data. If specified (and not with compute-only), '
+                             'then script will estimate and display time necessary '
+                             'to get elevation data for this number of points, **after** having '
+                             'actually generating the height map for given coordinates. '
+                             'This may be useful to estimate computation time before computing '
+                             'higher height maps.')
     args = parser.parse_args()
 
     resolution = args.resolution
@@ -121,6 +158,8 @@ def main():
 
     lat_diff_meters = geodesic((nw_lat, nw_lng), (sw_lat, sw_lng)).meters
     lng_diff_meters = geodesic((nw_lat, nw_lng), (ne_lat, ne_lng)).meters
+    print('Width', lng_diff_meters, 'meters')
+    print('Height', lat_diff_meters, 'meters')
     nb_div_lat = round(lat_diff_meters / resolution)
     nb_div_lng = round(lng_diff_meters / resolution)
     lat_gap_degrees = abs(sw_lat - nw_lat)
@@ -157,32 +196,41 @@ def main():
         sum_queries += length
     assert sum_queries == nb_points
 
-    print('Getting elevation for', width, 'x', height, '=', nb_points, 'points using', len(queries), 'queries.')
+    cpu_count = os.cpu_count()
+    nb_processes = max(int(3 * cpu_count / 4), 2)
+    print('Getting elevation for', width, 'x', height, '=', nb_points, 'points using', len(queries),
+          'queries in', nb_processes, '/', cpu_count, 'processes.')
     if args.compute_only:
         return
 
-    results = []
-    total = 0
+    tasks = [
+        (_get_url_along_path(*query), query[-1], number)
+        for number, query in enumerate(queries)
+    ]
+
     time_start = datetime.now()
-    for query in queries:
-        results.extend(_get_elevations_along_path(*query))
-        total += query[-1]
-        print('...', total, '/', nb_points)
+    with multiprocessing.Pool(processes=nb_processes) as pool:
+        pool_results = pool.imap_unordered(_get_elevations_along_path, tasks, chunksize=10)
+        pool_results = list(pool_results)
     time_end = datetime.now()
+
     profile = Profile(time_start, time_end)
     print('Got elevations', profile, 'for', nb_points, 'points.')
     if args.estimate > 0:
         estimation = (args.estimate * profile.total_microseconds / nb_points)
         print('Estimated time:', Profile(0, estimation), 'for', args.estimate, 'points.')
 
+    results = []
+    pool_results.sort(key=lambda val: val[0])
+    for pool_result in pool_results:
+        results.extend(pool_result[1])
     min_resolution = None
     max_resolution = None
     min_elevation = None
     max_elevation = None
     elevations = []
     for result in results:
-        elevation = result['elevation']
-        resolution = result['resolution']
+        elevation, resolution = result
         if min_resolution is None or min_resolution > resolution:
             min_resolution = resolution
         if max_resolution is None or max_resolution < resolution:
