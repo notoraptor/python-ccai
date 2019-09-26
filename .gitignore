@@ -1,3 +1,7 @@
 .idea
 *.png
+*.json
 __pycache__
+python_ccai.egg-info
+/*.txt
+*.gz
