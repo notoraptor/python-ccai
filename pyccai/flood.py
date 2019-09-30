@@ -1,4 +1,5 @@
 import sys
+import math
 from typing import Dict, List, Iterable, Set, Union, Tuple, Callable, Any
 
 from geopy.distance import geodesic
@@ -8,6 +9,8 @@ from pyccai.profiling import Profiler
 LAT, LNG, ALT, RES = 0, 1, 2, 3
 
 KILOMETER = 1000
+DEMI_KM_HYPOTHENUS = (KILOMETER) * math.sqrt(2) / 2
+DEMI_KM_HYPOTHENUS_GEODESIC = geodesic(meters=DEMI_KM_HYPOTHENUS)
 DEMI_KILOMETER_GEODESIC = geodesic(meters=KILOMETER / 2)
 FULL_KILOMETER_GEODESIC = geodesic(meters=KILOMETER)
 
@@ -218,53 +221,60 @@ def get_points_in_rectangle(coordinates, north, south, west, east):
     return points
 
 
-def get_neighbors(point, coordinates, map_north, map_south, map_west, map_east):
-    # type: (Point, List[List[Point]], float, float, float, float) -> List[Point]
+def get_neighbors(point, coordinates, map_north, map_south, map_west, map_east, in_map=False):
+    # type: (Point, List[List[Point]], float, float, float, float, bool) -> List[Point]
     # Compute bounds of rectangles centered on point with 1 Km side.
-    north = DEMI_KILOMETER_GEODESIC.destination(point.position, 0).latitude
-    south = DEMI_KILOMETER_GEODESIC.destination(point.position, 180).latitude
-    west = DEMI_KILOMETER_GEODESIC.destination(point.position, -90).longitude
-    east = DEMI_KILOMETER_GEODESIC.destination(point.position, 90).longitude
-    a_in = in_rectangle(north, west, map_north, map_south, map_west, map_east)
-    b_in = in_rectangle(north, east, map_north, map_south, map_west, map_east)
-    c_in = in_rectangle(south, east, map_north, map_south, map_west, map_east)
-    d_in = in_rectangle(south, west, map_north, map_south, map_west, map_east)
-    case = a_in * 8 + b_in * 4 + c_in * 2 + d_in
-    if case != Cases.ABCD:
-        if case == Cases.A:
-            south = map_south
-            east = map_east
-            north = FULL_KILOMETER_GEODESIC.destination((south, east), 0).latitude
-            west = FULL_KILOMETER_GEODESIC.destination((south, east), -90).longitude
-        elif case == Cases.B:
-            south = map_south
-            west = map_west
-            north = FULL_KILOMETER_GEODESIC.destination((south, west), 0).latitude
-            east = FULL_KILOMETER_GEODESIC.destination((south, west), 90).longitude
-        elif case == Cases.C:
-            north = map_north
-            west = map_west
-            south = FULL_KILOMETER_GEODESIC.destination((north, west), 180).latitude
-            east = FULL_KILOMETER_GEODESIC.destination((north, west), 90).longitude
-        elif case == Cases.D:
-            north = map_north
-            east = map_east
-            west = FULL_KILOMETER_GEODESIC.destination((north, east), -90).longitude
-            south = FULL_KILOMETER_GEODESIC.destination((north, east), 180).latitude
-        elif case == Cases.AB:
-            south = map_south
-            north = FULL_KILOMETER_GEODESIC.destination((south, west), 0).latitude
-        elif case == Cases.CD:
-            north = map_north
-            south = FULL_KILOMETER_GEODESIC.destination((north, west), 180).latitude
-        elif case == Cases.AD:
-            east = map_east
-            west = FULL_KILOMETER_GEODESIC.destination((north, east), -90).longitude
-        elif case == Cases.BC:
-            west = map_west
-            east = FULL_KILOMETER_GEODESIC.destination((north, west), 90).longitude
-        else:
-            raise RuntimeError('Impossible case %s' % case)
+    north_east = DEMI_KILOMETER_GEODESIC.destination(point.position, 45)
+    south_west = DEMI_KILOMETER_GEODESIC.destination(point.position, 180 + 45)
+    north = north_east.latitude
+    south = south_west.latitude
+    west = south_west.longitude
+    east = north_east.longitude
+    # north = DEMI_KILOMETER_GEODESIC.destination(point.position, 0).latitude
+    # south = DEMI_KILOMETER_GEODESIC.destination(point.position, 180).latitude
+    # west = DEMI_KILOMETER_GEODESIC.destination(point.position, -90).longitude
+    # east = DEMI_KILOMETER_GEODESIC.destination(point.position, 90).longitude
+    if in_map:
+        a_in = in_rectangle(north, west, map_north, map_south, map_west, map_east)
+        b_in = in_rectangle(north, east, map_north, map_south, map_west, map_east)
+        c_in = in_rectangle(south, east, map_north, map_south, map_west, map_east)
+        d_in = in_rectangle(south, west, map_north, map_south, map_west, map_east)
+        case = a_in * 8 + b_in * 4 + c_in * 2 + d_in
+        if case != Cases.ABCD:
+            if case == Cases.A:
+                south = map_south
+                east = map_east
+                north = FULL_KILOMETER_GEODESIC.destination((south, east), 0).latitude
+                west = FULL_KILOMETER_GEODESIC.destination((south, east), -90).longitude
+            elif case == Cases.B:
+                south = map_south
+                west = map_west
+                north = FULL_KILOMETER_GEODESIC.destination((south, west), 0).latitude
+                east = FULL_KILOMETER_GEODESIC.destination((south, west), 90).longitude
+            elif case == Cases.C:
+                north = map_north
+                west = map_west
+                south = FULL_KILOMETER_GEODESIC.destination((north, west), 180).latitude
+                east = FULL_KILOMETER_GEODESIC.destination((north, west), 90).longitude
+            elif case == Cases.D:
+                north = map_north
+                east = map_east
+                west = FULL_KILOMETER_GEODESIC.destination((north, east), -90).longitude
+                south = FULL_KILOMETER_GEODESIC.destination((north, east), 180).latitude
+            elif case == Cases.AB:
+                south = map_south
+                north = FULL_KILOMETER_GEODESIC.destination((south, west), 0).latitude
+            elif case == Cases.CD:
+                north = map_north
+                south = FULL_KILOMETER_GEODESIC.destination((north, west), 180).latitude
+            elif case == Cases.AD:
+                east = map_east
+                west = FULL_KILOMETER_GEODESIC.destination((north, east), -90).longitude
+            elif case == Cases.BC:
+                west = map_west
+                east = FULL_KILOMETER_GEODESIC.destination((north, west), 90).longitude
+            else:
+                raise RuntimeError('Impossible case %s' % case)
     # Get points in rectangle.
     return get_points_in_rectangle(coordinates, north, south, west, east)
 
