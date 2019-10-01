@@ -5,3 +5,4 @@ __pycache__
 python_ccai.egg-info
 /*.txt
 *.gz
+/*.js

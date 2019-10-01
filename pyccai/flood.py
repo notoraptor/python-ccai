@@ -1,7 +1,10 @@
-import sys
 import math
-from typing import Dict, List, Iterable, Set, Union, Tuple, Callable, Any
+import os
+import sys
+from typing import Dict, List, Iterable, Set, Callable, Any
 
+import ujson as json
+from PIL import Image
 from geopy.distance import geodesic
 
 from pyccai.profiling import Profiler
@@ -18,6 +21,27 @@ ANGLE_WEST = -90
 ANGLE_NORTH = 0
 ANGLE_EAST = 90
 ANGLE_SOUTH = 180
+
+RED = (255, 0, 0)
+BLUE = (0, 0, 255)
+YELLOW = (255, 255, 0)
+
+
+def pixel_is_blue(pixel):
+    return pixel[2] > pixel[0] and pixel[2] > pixel[1]
+
+
+class MapImage:
+    __slots__ = 'width', 'height', 'pixels'
+
+    def __init__(self, path):
+        image = Image.open(path)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        width, height = image.size
+        self.width = width
+        self.height = height
+        self.pixels = list(image.getdata())
 
 
 class Point:
@@ -55,20 +79,22 @@ class Point:
 
 
 class Bounds:
-    __slots__ = ('north', 'south', 'east', 'west', 'points')
+    __slots__ = ('north', 'south', 'east', 'west', 'nb_points')
     north: float
     south: float
     east: float
     west: float
-    points: List[Point]
 
     def __init__(self, points):
-        # type: (Iterable[Point]) -> None
+        # type: (List[Point]) -> None
         self.north = max(pt.lat for pt in points)
         self.south = min(pt.lat for pt in points)
         self.west = min(pt.lng for pt in points)
         self.east = max(pt.lng for pt in points)
-        self.points = points if isinstance(points, list) else list(points)
+        self.nb_points = len(points)
+
+    def to_json(self):
+        return [self.north, self.south, self.west, self.east]
 
     @property
     def north_west(self):
@@ -86,14 +112,22 @@ class Bounds:
     def south_east(self):
         return self.south, self.east
 
+    @property
+    def width(self):
+        return max(geodesic(self.north_west, self.north_east).meters,
+                   geodesic(self.south_west, self.south_east).meters)
+
+    @property
+    def height(self):
+        return max(geodesic(self.north_west, self.south_west).meters,
+                   geodesic(self.north_east, self.south_east).meters)
+
     def __str__(self):
         return 'Rectangle(north_west=%s, nb=%d, width=%s, height=%s)' % (
             self.north_west,
-            len(self.points),
-            max(geodesic(self.north_west, self.north_east).meters,
-                geodesic(self.south_west, self.south_east).meters),
-            max(geodesic(self.north_west, self.south_west).meters,
-                geodesic(self.north_east, self.south_east).meters)
+            self.nb_points,
+            self.width,
+            self.height
         )
 
     def __repr__(self):
@@ -104,6 +138,36 @@ class Cases:
     D, C, CD, B, BD, BC, BCD, A, AD, AC, ACD, AB, ABD, ABC, ABCD = tuple(range(1, 16))
     strings = [None, 'D', 'C', 'CD', 'B', 'BD', 'BC', 'BCD', 'A', 'AD', 'AC', 'ACD', 'AB', 'ABD',
                'ABC', 'ABCD']
+
+
+class Coordinates:
+    __slots__ = ('map_north', 'map_south', 'map_west', 'map_east', 'coordinates')
+
+    def __init__(self, points):
+        # type: (Iterable[Point]) -> None
+        self.map_north = None
+        self.map_south = None
+        self.map_west = None
+        self.map_east = None
+        lat_to_points = {}  # type: Dict[float, List[Point]]
+
+        for i, point in enumerate(points):
+            if i == 0:
+                self.map_north = self.map_south = point.lat
+                self.map_west = self.map_east = point.lng
+            else:
+                if self.map_north < point.lat:
+                    self.map_north = point.lat
+                if self.map_south > point.lat:
+                    self.map_south = point.lat
+                if self.map_west > point.lng:
+                    self.map_west = point.lng
+                if self.map_east < point.lng:
+                    self.map_east = point.lng
+            lat_to_points.setdefault(point.lat, []).append(point)
+        for lat in lat_to_points:
+            lat_to_points[lat].sort()
+        self.coordinates = [lat_to_points[lat] for lat in sorted(lat_to_points)]
 
 
 def isolate_groups(points):
@@ -221,70 +285,98 @@ def get_points_in_rectangle(coordinates, north, south, west, east):
     return points
 
 
-def get_neighbors(point, coordinates, map_north, map_south, map_west, map_east, in_map=False):
-    # type: (Point, List[List[Point]], float, float, float, float, bool) -> List[Point]
+def get_neighbors(point, coords, in_map=False):
+    # type: (Point, Coordinates, bool) -> List[Point]
     # Compute bounds of rectangles centered on point with 1 Km side.
-    north_east = DEMI_KILOMETER_GEODESIC.destination(point.position, 45)
-    south_west = DEMI_KILOMETER_GEODESIC.destination(point.position, 180 + 45)
-    north = north_east.latitude
-    south = south_west.latitude
-    west = south_west.longitude
-    east = north_east.longitude
-    # north = DEMI_KILOMETER_GEODESIC.destination(point.position, 0).latitude
-    # south = DEMI_KILOMETER_GEODESIC.destination(point.position, 180).latitude
-    # west = DEMI_KILOMETER_GEODESIC.destination(point.position, -90).longitude
-    # east = DEMI_KILOMETER_GEODESIC.destination(point.position, 90).longitude
+    # north_east = DEMI_KILOMETER_GEODESIC.destination(point.position, 45)
+    # south_west = DEMI_KILOMETER_GEODESIC.destination(point.position, 180 + 45)
+    # north = north_east.latitude
+    # south = south_west.latitude
+    # west = south_west.longitude
+    # east = north_east.longitude
+    north = DEMI_KILOMETER_GEODESIC.destination(point.position, 0).latitude
+    south = DEMI_KILOMETER_GEODESIC.destination(point.position, 180).latitude
+    west = DEMI_KILOMETER_GEODESIC.destination(point.position, -90).longitude
+    east = DEMI_KILOMETER_GEODESIC.destination(point.position, 90).longitude
     if in_map:
-        a_in = in_rectangle(north, west, map_north, map_south, map_west, map_east)
-        b_in = in_rectangle(north, east, map_north, map_south, map_west, map_east)
-        c_in = in_rectangle(south, east, map_north, map_south, map_west, map_east)
-        d_in = in_rectangle(south, west, map_north, map_south, map_west, map_east)
+        # A---B
+        # |   |
+        # D---C
+        a_in = in_rectangle(
+            north, west, coords.map_north, coords.map_south, coords.map_west, coords.map_east)
+        b_in = in_rectangle(
+            north, east, coords.map_north, coords.map_south, coords.map_west, coords.map_east)
+        c_in = in_rectangle(
+            south, east, coords.map_north, coords.map_south, coords.map_west, coords.map_east)
+        d_in = in_rectangle(
+            south, west, coords.map_north, coords.map_south, coords.map_west, coords.map_east)
         case = a_in * 8 + b_in * 4 + c_in * 2 + d_in
         if case != Cases.ABCD:
             if case == Cases.A:
-                south = map_south
-                east = map_east
+                south = coords.map_south
+                east = coords.map_east
                 north = FULL_KILOMETER_GEODESIC.destination((south, east), 0).latitude
                 west = FULL_KILOMETER_GEODESIC.destination((south, east), -90).longitude
             elif case == Cases.B:
-                south = map_south
-                west = map_west
+                south = coords.map_south
+                west = coords.map_west
                 north = FULL_KILOMETER_GEODESIC.destination((south, west), 0).latitude
                 east = FULL_KILOMETER_GEODESIC.destination((south, west), 90).longitude
             elif case == Cases.C:
-                north = map_north
-                west = map_west
+                north = coords.map_north
+                west = coords.map_west
                 south = FULL_KILOMETER_GEODESIC.destination((north, west), 180).latitude
                 east = FULL_KILOMETER_GEODESIC.destination((north, west), 90).longitude
             elif case == Cases.D:
-                north = map_north
-                east = map_east
+                north = coords.map_north
+                east = coords.map_east
                 west = FULL_KILOMETER_GEODESIC.destination((north, east), -90).longitude
                 south = FULL_KILOMETER_GEODESIC.destination((north, east), 180).latitude
             elif case == Cases.AB:
-                south = map_south
+                south = coords.map_south
                 north = FULL_KILOMETER_GEODESIC.destination((south, west), 0).latitude
             elif case == Cases.CD:
-                north = map_north
+                north = coords.map_north
                 south = FULL_KILOMETER_GEODESIC.destination((north, west), 180).latitude
             elif case == Cases.AD:
-                east = map_east
+                east = coords.map_east
                 west = FULL_KILOMETER_GEODESIC.destination((north, east), -90).longitude
             elif case == Cases.BC:
-                west = map_west
+                west = coords.map_west
                 east = FULL_KILOMETER_GEODESIC.destination((north, west), 90).longitude
             else:
-                raise RuntimeError('Impossible case %s' % case)
+                is_error = True
+                if case == 0:
+                    # map_a_in = in_rectangle(coords.map_north, coords.map_west, north, south, west, east)
+                    # map_b_in = in_rectangle(coords.map_north, coords.map_east, north, south, west, east)
+                    # map_c_in = in_rectangle(coords.map_south, coords.map_east, north, south, west, east)
+                    # map_d_in = in_rectangle(coords.map_south, coords.map_west, north, south, west, east)
+                    # map_case = map_a_in * 8 + map_b_in * 4 + map_c_in * 2 + map_d_in
+                    # is_error = map_case not in (Cases.A, Cases.B, Cases.C, Cases.D, Cases.AB, Cases.CD, Cases.AD, Cases.BC)
+                    is_error = False
+                if is_error:
+                    print('Point', point.position)
+                    print('Rect_', north, south, west, east)
+                    print('Map__', coords.map_north, coords.map_south, coords.map_west, coords.map_east)
+                    raise RuntimeError('Impossible case %s' % Cases.strings[case])
     # Get points in rectangle.
-    return get_points_in_rectangle(coordinates, north, south, west, east)
+    return get_points_in_rectangle(coords.coordinates, north, south, west, east)
 
 
 def main():
-    if len(sys.argv) != 3:
-        print('Usage: python flood.py <map-file-name> <flood-threshold>')
+    if len(sys.argv) != 4:
+        print('Usage: python flood.py <map-file-name> <flood-threshold> <output-name>')
         exit(-1)
     map_file_name = sys.argv[1]
     flood_threshold = float(sys.argv[2])
+    output_name = sys.argv[3]
+    map_title = os.path.splitext(os.path.basename(map_file_name))[0]
+    map_image_path = '%s.png' % map_title
+
+    image = None
+    if os.path.isfile(map_image_path):
+        image = MapImage(map_image_path)
+
     flood = []  # type: List[Point]
     print('Loading map ...')
     debug_step = 2000000
@@ -299,6 +391,15 @@ def main():
                 pieces = line.strip().split()
                 alt = float(pieces[ALT])
                 if alt <= flood_threshold:
+                    if image:
+                        # skip water
+                        map_x = index_line % width
+                        map_y = index_line // width
+                        img_x = round(map_x * (image.width - 1) / (width - 1))
+                        img_y = round(map_y * (image.height - 1) / (height - 1))
+                        img_index = img_y * image.height + img_x
+                        if pixel_is_blue(image.pixels[img_index]):
+                            continue
                     flood.append(Point(float(pieces[LAT]), float(pieces[LNG]), alt))
                 if (index_line + 1) % debug_step == 0:
                     print('Loaded line', index_line + 1, '/', size)
@@ -308,99 +409,28 @@ def main():
     print('Got', len(flood), 'flooded points /', size, 'with threshold', flood_threshold,
           '(%s %%)' % (len(flood) * 100 / size))
 
-    lat_to_points = {}  # type: Dict[float, List[Point]]
-    map_north = flood[0].lat
-    map_south = flood[0].lat
-    map_west = flood[0].lng
-    map_east = flood[0].lng
-    lat_to_points[flood[0].lat] = [flood[0]]
-    with Profiler('Find whole flood bounds and range points per latitude.'):
-        for i in range(1, len(flood)):
-            point = flood[i]
-            if map_north < point.lat:
-                map_north = point.lat
-            if map_south > point.lat:
-                map_south = point.lat
-            if map_west > point.lng:
-                map_west = point.lng
-            if map_east < point.lng:
-                map_east = point.lng
-            lat_to_points.setdefault(point.lat, []).append(point)
+    rectangles = []
+    points = set(flood)
+    with Profiler('Group flooded points in rectangle (very approximate algorithm)'):
+        while points:
+            print('Remaining', len(points), 'point(s).')
+            coordinates = Coordinates(points)
+            point = max(points)
+            neighbors = get_neighbors(point, coordinates, True)
+            points.difference_update(neighbors)
+            if len(neighbors) == 1:
+                continue
+            bounds = Bounds(neighbors)
+            if bounds.width < 10 or bounds.height < 10:
+                continue
+            rectangles.append(bounds)
+    print('Found', len(rectangles), 'rectangle(s) for', len(flood), 'point(s).')
+    print(min(r.nb_points for r in rectangles), max(r.nb_points for r in rectangles))
 
-    with Profiler('Generate flood coordinates table.'):
-        for lat in lat_to_points:
-            lat_to_points[lat].sort()
-        coordinates = [lat_to_points[lat] for lat in sorted(lat_to_points)]
-
-    # A---B
-    # |   |
-    # D---C
-    simulation = {}
-    with Profiler('Find neighbors for each point.'):
-        for i_pt, point in enumerate(flood):
-            simulation[point] = get_neighbors(point, coordinates, map_north, map_south, map_west, map_east)
-            if i_pt % 2000 == 0:
-                print(i_pt + 1, '/', len(flood))
-    print(min(len(r) for r in simulation.values()), max(len(r) for r in simulation.values()))
-    exit(-1)
-
-    sorted_lat_and_points = [(lat, lat_to_points[lat]) for lat in sorted(lat_to_points)]
-    nb_latitudes = len(sorted_lat_and_points)
-    start = 0
-    cursor = 1
-    with Profiler('Find groups among %d latitude(s)' % len(sorted_lat_and_points)):
-        while start < nb_latitudes:
-            prev_lat = sorted_lat_and_points[start][0]
-            limit = FULL_KILOMETER_GEODESIC.destination((prev_lat, 0), 0)
-            while True:
-                if cursor < nb_latitudes:
-                    if sorted_lat_and_points[cursor][0] <= limit.latitude:
-                        cursor += 1
-                    else:
-                        break
-                else:
-                    cursor = nb_latitudes
-                    break
-            print('Computing [%d; %d]' % (start, cursor - 1))
-            local_points = []
-            for i in range(start, cursor):
-                local_points.extend(sorted_lat_and_points[i][1])
-            local_points.sort(key=lambda pt: (pt.lng, pt.lat))
-            for j in range(1, len(local_points)):
-                prev_point = local_points[j - 1]
-                curr_point = local_points[j]
-                local_distance = geodesic(prev_point.position, curr_point.position).meters
-                if local_distance <= 1000:
-                    prev_point.connect(curr_point, local_distance)
-            if cursor == start + 1:
-                start = cursor
-            elif cursor < nb_latitudes:
-                distance = geodesic((sorted_lat_and_points[cursor - 1][0], 0),
-                                    (sorted_lat_and_points[cursor][0], 0)).meters
-                if distance <= 1000:
-                    start = cursor - 1
-                else:
-                    start = cursor
-            else:
-                break
-            cursor = start + 1
-
-    with Profiler('Isolate groups'):
-        groups = isolate_groups(flood)
-
-    valid_groups = [group for group in groups if len(group) > 1]
-    rectangle_centers = []
-    print('Found', len(valid_groups), '/', len(groups), 'valid groups (with at least 2 points).')
-
-    with Profiler('Compute rectangles'):
-        for group in valid_groups:
-            rectangle_centers.append(select_rectangle_centers(group))
-
-    for i in range(len(valid_groups)):
-        print('Group', i + 1, 'with', len(valid_groups[i]), 'points represented with',
-              len(rectangle_centers[i]), 'rectangle(s).')
-        for rectangle in rectangle_centers[i]:
-            print('\t', rectangle)
+    output_file_name = '%s.js' % output_name
+    with open(output_file_name, 'w') as file:
+        file.write('export const FLOOD = %s;' % json.dumps([r.to_json() for r in rectangles]))
+    print('Output into', output_file_name)
 
 
 if __name__ == '__main__':
